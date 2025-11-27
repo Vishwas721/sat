@@ -1,5 +1,5 @@
 """
-SPIKE SAT-8: Wind Analysis Module PoC
+SPIKE SAT-4: Wind Analysis Module PoC
 Author: Vishwas (Site Analysis Tool Team)
 Date: Nov 2025
 
