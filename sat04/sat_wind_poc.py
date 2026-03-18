@@ -13,242 +13,221 @@ It also demonstrates the 'Orientation Logic Engine' (AC4) which translates
 weather data into architectural design advice.
 """
 
-import ee
-import json
-import math
-from datetime import datetime
 
 # ==========================================
 # 0. INITIALIZATION
 # ==========================================
+
+import math
+import datetime
+import ee
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+from typing import List, Dict
+
+# Initialize FastAPI app
+app = FastAPI(title="SAT Wind Analysis Engine")
+
+# --- Initialize Google Earth Engine ---
+# Run `earthengine authenticate` in terminal before running
 def initialize_gee():
     try:
         ee.Initialize(project='site-analysis-poc')
         print("✅ GEE Initialized successfully.")
-    except Exception as e:
+    except Exception:
         print(f"⚠️ Auth required. Triggering flow...")
         ee.Authenticate()
         ee.Initialize(project='site-analysis-poc')
+        print("✅ GEE Initialized successfully after authentication.")
 
-# ==========================================
-# 1. LOGIC ENGINES (The "Brains")
-# ==========================================
 
-class WindRoseProcessor:
-    """
-    Converts raw daily vectors into 16-point frequency bins.
-    """
-    DIRECTIONS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
-                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-
-    @staticmethod
-    def process(daily_records):
-        bins = {d: 0 for d in WindRoseProcessor.DIRECTIONS}
-        total_valid = 0
-        
-        # Speed Bins for categorization
-        speed_sums = {d: 0.0 for d in WindRoseProcessor.DIRECTIONS}
-
-        for record in daily_records:
-            u = record.get('u')
-            v = record.get('v')
-            
-            if u is None or v is None: continue
-
-            speed = math.sqrt(u**2 + v**2)
-            if speed < 0.5: continue # Calm wind is often excluded from Direction analysis
-
-            # Calculate Meteorological Direction (0-360)
-            # atan2(v, u) gives math angle. 
-            math_angle = math.degrees(math.atan2(v, u))
-            met_dir = (270 - math_angle) % 360
-            
-            # Binning
-            idx = round(met_dir / 22.5) % 16
-            cardinal = WindRoseProcessor.DIRECTIONS[idx]
-            
-            bins[cardinal] += 1
-            speed_sums[cardinal] += speed
-            total_valid += 1
-        
-        # Format for Frontend (Plotly)
-        rose_data = []
-        dominant_dir = "N"
-        max_freq = 0
-
-        if total_valid > 0:
-            for d in WindRoseProcessor.DIRECTIONS:
-                count = bins[d]
-                freq = (count / total_valid) * 100
-                avg_spd = speed_sums[d] / count if count > 0 else 0
-                
-                if freq > max_freq:
-                    max_freq = freq
-                    dominant_dir = d
-
-                rose_data.append({
-                    "direction": d,
-                    "frequency": round(freq, 1),
-                    "avg_speed": round(avg_spd, 1)
-                })
-                
-        return rose_data, dominant_dir
-
-class OrientationOptimizer:
-    """
-    Translates Wind Stats into Architectural Rules (AC4).
-    """
-    FACADES = {
-        "N": "North", "S": "South", "E": "East", "W": "West",
-        "NE": "North-East", "NW": "North-West", "SE": "South-East", "SW": "South-West",
-        "NNE": "NNE", "ENE": "ENE", "ESE": "ESE", "SSE": "SSE",
-        "SSW": "SSW", "WSW": "WSW", "WNW": "WNW", "NNW": "NNW"
-    }
-
-    @staticmethod
-    def get_advice(dominant_dir):
-        facade = OrientationOptimizer.FACADES.get(dominant_dir, dominant_dir)
-        advice = []
-
-        # Rule 1: Capture
-        advice.append({
-            "category": "Fenestration",
-            "suggestion": f"Maximize operable windows on the {facade} facade.",
-            "reason": f"Captures positive pressure from prevailing {dominant_dir} winds."
-        })
-
-        # Rule 2: Axis (Perpendicular)
-        advice.append({
-            "category": "Massing",
-            "suggestion": f"Orient building long axis perpendicular to {dominant_dir}.",
-            "reason": "Maximizes cross-ventilation surface area."
-        })
-
-        # Rule 3: Solar Conflict (West/East)
-        if "W" in dominant_dir or "E" in dominant_dir:
-            advice.append({
-                "category": "Shading",
-                "suggestion": "Use deep louvers or porous screens (Jaalis).",
-                "reason": f"Prevailing wind ({dominant_dir}) coincides with low-angle sun. Block sun, admit wind."
-            })
-            
-        return advice
-
-# ==========================================
-# 2. DATA FETCHERS (The "Triple Tier")
-# ==========================================
-
-def fetch_tier1_trends(lat, lon):
-    """
-    TIER 1: ERA5-Land Monthly
-    Goal: Fast trend lines for Dashboard.
-    """
-    print("   ...Fetching Tier 1 (Monthly Trends)")
-    point = ee.Geometry.Point([lon, lat])
-    
-    # Fetch last 5 years only for speed
-    data = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR") \
-        .filterDate('2019-01-01', '2023-12-31') \
-        .select('u_component_of_wind_10m') \
-        .getRegion(point, 11000).getInfo()
-    
-    # Return simple count to prove it worked
-    return len(data) - 1 # Minus header
-
-def fetch_tier2_analysis(lat, lon):
-    """
-    TIER 2: ERA5-Land Daily
-    Goal: Detailed Wind Rose & Orientation Logic.
-    """
-    print("   ...Fetching Tier 2 (Daily History for Wind Rose)")
-    point = ee.Geometry.Point([lon, lat])
-    
-    # Fetch Daily data for 'Monsoon' season (Jun-Sep) over 5 years
-    # We limit to 5 years for PoC execution speed
-    dataset = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR") \
-        .filterDate('2019-01-01', '2023-12-31') \
-        .filter(ee.Filter.calendarRange(6, 9, 'month')) \
-        .select(['u_component_of_wind_10m', 'v_component_of_wind_10m'])
-    
-    # Client-side processing for PoC (Production would use GEE Reducers)
-    # limit(1000) prevents timeouts during local python testing
-    raw_data = dataset.getRegion(point, 11000).getInfo()
-    
-    # Parse into list of dicts
-    headers = raw_data[0]
-    records = []
-    for row in raw_data[1:]:
-        r = dict(zip(headers, row))
-        records.append({
-            'u': r['u_component_of_wind_10m'], 
-            'v': r['v_component_of_wind_10m']
-        })
-        
-    return records
-
-def fetch_tier3_map_check(lat, lon):
-    """
-    TIER 3: ERA5 Standard (Global)
-    Goal: Verify Ocean coverage for Map Visualization.
-    """
-    print("   ...Fetching Tier 3 (Map Layer Check)")
-    
-    # Test Point: Arabian Sea (Offshore Mumbai)
-    sea_point = ee.Geometry.Point([72.0, 19.0])
-    
-    # Check if Standard ERA5 has data here
-    img = ee.ImageCollection("ECMWF/ERA5/DAILY").first()
-    val = img.reduceRegion(ee.Reducer.first(), sea_point, 28000).getInfo()
-    
-    return val.get('u_component_of_wind_10m') is not None
-
-# ==========================================
-# 3. MAIN EXECUTION
-# ==========================================
-def main():
-    print("\n🚀 STARTING SAT-8 TRIPLE-TIER POC...\n")
+@app.on_event("startup")
+async def startup_event():
+    """Initializes GEE when the API server starts."""
     initialize_gee()
+
+# ==========================================
+# 1. CORE MATH & CLIMATOLOGY LOGIC (AC2 & AC3)
+# ==========================================
+
+def calculate_wind_metrics(u: float, v: float):
+    """Calculates wind speed (m/s) and meteorological direction (degrees)."""
+    speed = math.sqrt(u**2 + v**2)
+    direction = (270 - (math.atan2(v, u) * (180 / math.pi))) % 360
+    return round(speed, 2), round(direction, 2)
+
+def get_compass_direction(degrees: float) -> str:
+    """Maps degrees to the 16-point wind rose."""
+    val = int((degrees / 22.5) + 0.5)
+    compass_points = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                      "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    return compass_points[(val % 16)]
+
+def get_imd_season(month: int) -> str:
+    """Maps months to standard Indian Meteorological Department seasons."""
+    if month in [1, 2]: return "Winter"
+    elif month in [3, 4, 5]: return "Pre-Monsoon"
+    elif month in [6, 7, 8, 9]: return "Southwest Monsoon"
+    elif month in [10, 11, 12]: return "Post-Monsoon"
+    return "Unknown"
+
+# ==========================================
+# 2. ARCHITECTURAL RULES ENGINE (AC4 & AC5)
+# ==========================================
+
+def get_orientation_advice(prevailing_dir: str, season: str) -> Dict[str, str]:
+    """Generates SME-validated architectural advice based on wind direction."""
     
-    # Test Site: Bangalore (REVA University)
-    LAT, LON = 13.11, 77.63
-    
-    # --- TIER 1 ---
-    trend_count = fetch_tier1_trends(LAT, LON)
-    print(f"✅ Tier 1 Success: Retrieved {trend_count} monthly records for Sparkline.\n")
-    
-    # --- TIER 2 ---
-    daily_records = fetch_tier2_analysis(LAT, LON)
-    print(f"✅ Tier 2 Success: Retrieved {len(daily_records)} daily records for Analysis.")
-    
-    # Process Logic
-    print("   ...Running WindRoseProcessor...")
-    rose_data, dominant_dir = WindRoseProcessor.process(daily_records)
-    
-    print("   ...Running OrientationOptimizer...")
-    advice = OrientationOptimizer.get_advice(dominant_dir)
-    
-    # --- TIER 3 ---
-    has_ocean = fetch_tier3_map_check(LAT, LON)
-    map_status = "READY" if has_ocean else "FAILED"
-    print(f"✅ Tier 3 Success: Ocean Data Available? {has_ocean} ({map_status} for Map Layer).\n")
-    
-    # --- FINAL OUTPUT (The Payload) ---
-    final_payload = {
-        "meta": {
-            "spike_id": "SAT-8",
-            "location": "Bangalore",
-            "tier_architecture": "Hybrid (Land-Monthly + Land-Daily + Standard)"
-        },
-        "analysis": {
-            "season": "Monsoon (Jun-Sep)",
-            "dominant_wind": dominant_dir,
-            "wind_rose_sample": rose_data[:3], # Show first 3 for brevity
-        },
-        "architectural_insights": advice
+    # Base heuristic: Orient long axis perpendicular to prevailing wind
+    axis_map = {
+        "N": "E-W", "S": "E-W", "E": "N-S", "W": "N-S",
+        "NE": "NW-SE", "SW": "NW-SE", "NW": "NE-SW", "SE": "NE-SW",
+        # Adding slight variations for 16-point compass
+        "NNE": "WNW-ESE", "SSW": "WNW-ESE", "ENE": "NNW-SSE", "WSW": "NNW-SSE",
+        "NNW": "ENE-WSW", "SSE": "ENE-WSW", "WNW": "NNE-SSW", "ESE": "NNE-SSW"
     }
     
-    print("📦 FINAL JSON PAYLOAD (API CONTRACT):")
-    print(json.dumps(final_payload, indent=2))
+    recommended_axis = axis_map.get(prevailing_dir, "Site-Specific")
+    
+    # Dynamic insight generation
+    insight = f"The prevailing wind during {season} is from the {prevailing_dir}."
+    strategy = f"Orient the building's long axis {recommended_axis} to maximize natural cross-ventilation."
+
+    # Solar conflict edge cases (West Sun)
+    if "W" in prevailing_dir:
+        strategy += " However, because capturing West winds exposes the facade to harsh afternoon solar heat gain, utilize deep louvers, shaded verandas, or staggered fenestration on the windward side."
+    
+    # Monsoon rain edge cases
+    if season == "Southwest Monsoon" and "SW" in prevailing_dir:
+        strategy += " Ensure large openings on the SW facade have deep overhangs (chajjas) to prevent driving rain ingress during monsoon squalls."
+
+    return {
+        "recommended_axis": recommended_axis,
+        "report_summary": f"{insight} {strategy}"
+    }
+
+# ==========================================
+# 3. GEE DATA FETCHING (AC1)
+# ==========================================
+
+def fetch_gee_wind_data(lat: float, lon: float, years: int):
+    """Fetches historical U and V vectors from ERA5-Land."""
+    point = ee.Geometry.Point([lon, lat])
+    end_date = datetime.date.today()
+    start_date = end_date.replace(year=end_date.year - years)
+
+    collection = (ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+                  .filterBounds(point)
+                  .filterDate(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+                  .select(['u_component_of_wind_10m', 'v_component_of_wind_10m']))
+
+    return collection.getRegion(point, scale=11132).getInfo()
+
+# ==========================================
+# 4. API MODELS & ROUTE (The JSON Contract)
+# ==========================================
+
+class WindFrequencyBin(BaseModel):
+    direction: str
+    frequency_percentage: float
+    avg_speed_ms: float
+
+class SeasonalWindData(BaseModel):
+    season_name: str
+    prevailing_direction: str
+    wind_rose: List[WindFrequencyBin]
+    architectural_advice: Dict[str, str]
+
+class WindAnalysisResponse(BaseModel):
+    site_coordinates: Dict[str, float]
+    annual_prevailing_direction: str
+    annual_architectural_advice: Dict[str, str]
+    annual_wind_rose: List[WindFrequencyBin]
+    seasonal_data: List[SeasonalWindData]
+
+@app.get("/analysis/wind/climatology", response_model=WindAnalysisResponse)
+async def get_wind_climatology(lat: float = Query(...), lon: float = Query(...), years: int = Query(10)):
+    try:
+        raw_data = fetch_gee_wind_data(lat, lon, years)
+        if not raw_data or len(raw_data) <= 1:
+            raise ValueError("No data returned from GEE.")
+
+        headers = raw_data[0]
+        time_idx, u_idx, v_idx = headers.index('time'), headers.index('u_component_of_wind_10m'), headers.index('v_component_of_wind_10m')
+
+        compass_points = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+        seasons = ["Annual", "Winter", "Pre-Monsoon", "Southwest Monsoon", "Post-Monsoon"]
+        
+        # Initialize data structures
+        aggregated_data = {s: {dir: {"count": 0, "speed_sum": 0.0} for dir in compass_points} for s in seasons}
+        total_days = {s: 0 for s in seasons}
+
+        # Process the raw vectors
+        for row in raw_data[1:]:
+            if row[u_idx] is None or row[v_idx] is None: continue
+            
+            month = datetime.datetime.fromtimestamp(row[time_idx] / 1000.0).month
+            speed, direction_deg = calculate_wind_metrics(row[u_idx], row[v_idx])
+            compass_dir = get_compass_direction(direction_deg)
+            season = get_imd_season(month)
+
+            # Annual aggregation
+            aggregated_data["Annual"][compass_dir]["count"] += 1
+            aggregated_data["Annual"][compass_dir]["speed_sum"] += speed
+            total_days["Annual"] += 1
+
+            # Seasonal aggregation
+            aggregated_data[season][compass_dir]["count"] += 1
+            aggregated_data[season][compass_dir]["speed_sum"] += speed
+            total_days[season] += 1
+
+        # Build the final response objects
+        def build_rose(season_key):
+            rose = []
+            days = total_days[season_key]
+            if days == 0: return rose
+            for dir_key, metrics in aggregated_data[season_key].items():
+                if metrics["count"] > 0:
+                    rose.append(WindFrequencyBin(
+                        direction=dir_key,
+                        frequency_percentage=round((metrics["count"] / days) * 100, 2),
+                        avg_speed_ms=round(metrics["speed_sum"] / metrics["count"], 2)
+                    ))
+            return sorted(rose, key=lambda x: x.frequency_percentage, reverse=True)
+
+        annual_rose = build_rose("Annual")
+        annual_prevailing = annual_rose[0].direction if annual_rose else "Unknown"
+        
+        seasonal_response = []
+        for s in ["Winter", "Pre-Monsoon", "Southwest Monsoon", "Post-Monsoon"]:
+            s_rose = build_rose(s)
+            if s_rose:
+                s_prevailing = s_rose[0].direction
+                seasonal_response.append(SeasonalWindData(
+                    season_name=s,
+                    prevailing_direction=s_prevailing,
+                    wind_rose=s_rose,
+                    architectural_advice=get_orientation_advice(s_prevailing, s)
+                ))
+
+        return WindAnalysisResponse(
+            site_coordinates={"lat": lat, "lon": lon},
+            annual_prevailing_direction=annual_prevailing,
+            annual_architectural_advice=get_orientation_advice(annual_prevailing, "the year"),
+            annual_wind_rose=annual_rose,
+            seasonal_data=seasonal_response
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
-    main()
+    print("Starting SAT Wind Analysis Engine...")
+    print("API docs: http://127.0.0.1:8000/docs")
+    try:
+        import uvicorn
+        uvicorn.run("sat_wind_poc:app", host="127.0.0.1", port=8000, reload=False)
+    except ModuleNotFoundError:
+        print("Missing dependency: uvicorn")
+        print("Install it with: pip install uvicorn")
