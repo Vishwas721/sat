@@ -32,7 +32,7 @@ app = FastAPI(title="SAT Wind Analysis Engine")
 # Run `earthengine authenticate` in terminal before running
 def initialize_gee():
     try:
-        ee.Initialize(project='site-analysis-poc')
+        ee.Initialize(project='your-gee-project-id')  # Replace with your GEE project ID
         print("✅ GEE Initialized successfully.")
     except Exception:
         print(f"⚠️ Auth required. Triggering flow...")
